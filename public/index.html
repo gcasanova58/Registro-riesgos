@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Registro de Riesgos</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <h1>Registro de Riesgos</h1>
+    <p class="sub">GECON SPA · ordenado por exposición (probabilidad × impacto, escala 1–25)</p>
+  </header>
+
+  <main>
+    <section class="resumen" id="resumen" aria-live="polite"></section>
+
+    <section class="filtros">
+      <label>Categoría
+        <select id="f-categoria"><option value="">Todas</option></select>
+      </label>
+      <label>Estado
+        <select id="f-estado">
+          <option value="activos">Activos (abierto + en respuesta)</option>
+          <option value="abierto">Abierto</option>
+          <option value="en_respuesta">En respuesta</option>
+          <option value="cerrado">Cerrado</option>
+          <option value="todos">Todos</option>
+        </select>
+      </label>
+      <span class="leyenda">
+        <span class="badge critico">▲ Alta exposición</span> exposición ≥ <b id="umbral">–</b>
+        <span class="badge aviso">! Sin estrategia</span> abierto sin estrategia de respuesta
+      </span>
+    </section>
+
+    <div class="tabla-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Categoría</th>
+            <th>Descripción</th>
+            <th class="num">Prob.</th>
+            <th class="num">Impacto</th>
+            <th class="num">Exposición</th>
+            <th>Estado</th>
+            <th>Estrategia de respuesta</th>
+            <th class="num">Historial</th>
+          </tr>
+        </thead>
+        <tbody id="cuerpo"></tbody>
+      </table>
+    </div>
+    <p id="mensaje" class="mensaje"></p>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
