@@ -8,16 +8,32 @@
 </head>
 <body>
   <header>
-    <h1>Registro de Riesgos</h1>
-    <p class="sub">GECON SPA · ordenado por exposición (probabilidad × impacto, escala 1–25)</p>
+    <h1>Registro Inteligente de Riesgos</h1>
+    <p class="sub">Impacto calificado por dimensión. Exposición = probabilidad × impacto, por cada una. El orden lo manda la prioridad del proyecto.</p>
   </header>
 
   <main>
     <section class="resumen" id="resumen" aria-live="polite"></section>
 
+    <section class="prioridad">
+      <h2>Prioridad del proyecto</h2>
+      <div class="prioridad-botones" id="prioridad-botones"></div>
+      <p class="prioridad-ayuda">El registro se ordena por la exposición de la primera dimensión; los empates los rompe la siguiente, y así. Usa ▲ para subir una dimensión.</p>
+    </section>
+
     <section class="filtros">
       <label>Categoría
         <select id="f-categoria"><option value="">Todas</option></select>
+      </label>
+      <label>Origen
+        <select id="f-origen">
+          <option value="todos">Todos</option>
+          <option value="interno">Interno</option>
+          <option value="externo">Externo</option>
+        </select>
+      </label>
+      <label>Proyecto
+        <select id="f-proyecto"><option value="todos">Todos</option></select>
       </label>
       <label>Estado
         <select id="f-estado">
@@ -28,30 +44,15 @@
           <option value="todos">Todos</option>
         </select>
       </label>
-      <span class="leyenda">
-        <span class="badge critico">▲ Alta exposición</span> exposición ≥ <b id="umbral">–</b>
-        <span class="badge aviso">! Sin estrategia</span> abierto sin estrategia de respuesta
-      </span>
     </section>
 
-    <div class="tabla-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>#</th>
-            <th>Categoría</th>
-            <th>Descripción</th>
-            <th class="num">Prob.</th>
-            <th class="num">Impacto</th>
-            <th class="num">Exposición</th>
-            <th>Estado</th>
-            <th>Estrategia de respuesta</th>
-            <th class="num">Historial</th>
-          </tr>
-        </thead>
-        <tbody id="cuerpo"></tbody>
-      </table>
+    <div class="leyenda">
+      <span class="badge critico">▲ Alta exposición</span> exposición máxima ≥ <b id="umbral">–</b>
+      <span class="badge aviso">! Sin estrategia</span> abierto sin estrategia de respuesta
+      <span class="badge pendiente">? Pendiente de calificación</span> sin evidencia suficiente
     </div>
+
+    <div id="lista" class="lista"></div>
     <p id="mensaje" class="mensaje"></p>
   </main>
 

@@ -2,6 +2,7 @@ const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const { pool, inicializar } = require('./db');
+const { generarReporteAnalisis } = require('./pdf');
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY;
@@ -18,6 +19,9 @@ for (const [nombre, valor] of Object.entries({ DATABASE_URL: process.env.DATABAS
 
 const ESTADOS = ['abierto', 'en_respuesta', 'cerrado'];
 const TIPOS_EVENTO = ['creacion', 'mencion', 'confirmacion', 'actualizacion'];
+const DIMENSIONES = ['cronograma', 'costo', 'calidad', 'alcance'];
+const ORIGENES = ['interno', 'externo'];
+const TIPOS_HALLAZGO = ['riesgo', 'indefinicion', 'inconsistencia'];
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -69,10 +73,28 @@ function nivel(valor, campo) {
   return n;
 }
 
+// null/ausente = "pendiente de calificacion humana": nunca se inventa un numero.
+function nivelOpcional(valor, campo) {
+  if (valor === undefined || valor === null) return null;
+  return nivel(valor, campo);
+}
+
 function estado(valor) {
   const e = String(valor).trim().toLowerCase().replace(/\s+/g, '_');
   if (!ESTADOS.includes(e)) throw new ErrorValidacion(`estado debe ser uno de: ${ESTADOS.join(', ')}`);
   return e;
+}
+
+function origenRiesgo(valor) {
+  const o = String(valor || '').trim().toLowerCase();
+  if (!ORIGENES.includes(o)) throw new ErrorValidacion(`origen debe ser uno de: ${ORIGENES.join(', ')}`);
+  return o;
+}
+
+function tipoHallazgo(valor) {
+  const t = String(valor || 'riesgo').trim().toLowerCase();
+  if (!TIPOS_HALLAZGO.includes(t)) throw new ErrorValidacion(`tipo_hallazgo debe ser uno de: ${TIPOS_HALLAZGO.join(', ')}`);
+  return t;
 }
 
 function textoObligatorio(valor, campo) {
@@ -86,15 +108,52 @@ function textoOpcional(valor) {
   return t || null;
 }
 
-function origen(body) {
+// Datos del documento de origen que sustenta la creacion o la mencion de un riesgo
+// (distinto del campo 'origen' del riesgo, que es interno/externo).
+function origenDocumento(body) {
   return {
     documento: textoObligatorio(body.documento, 'documento'),
     fecha_documento: normalizarFecha(body.fecha_documento),
     fragmento: textoObligatorio(body.fragmento, 'fragmento'),
+    nota: textoOpcional(body.nota),
+  };
+}
+
+function conPendiente(riesgo) {
+  const exposiciones = DIMENSIONES
+    .map((d) => riesgo[`exposicion_${d}`])
+    .filter((v) => v !== null && v !== undefined);
+  const exposicion_maxima = exposiciones.length ? Math.max(...exposiciones) : null;
+  const hayAlgunImpacto = DIMENSIONES.some((d) => riesgo[`impacto_${d}`] !== null && riesgo[`impacto_${d}`] !== undefined);
+  return {
+    ...riesgo,
+    exposicion_maxima,
+    alta_exposicion: exposicion_maxima !== null && exposicion_maxima >= UMBRAL,
+    pendiente_calificacion: riesgo.probabilidad === null || riesgo.probabilidad === undefined || !hayAlgunImpacto,
   };
 }
 
 const manejar = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+const CAMPOS_IMPACTO = Object.fromEntries(DIMENSIONES.map((d) => [`impacto_${d}`, d]));
+
+function leerDatosRiesgo(b, { requerido }) {
+  const datos = {};
+  if (requerido || b.categoria !== undefined) datos.categoria = textoObligatorio(b.categoria, 'categoria');
+  if (requerido || b.origen !== undefined) datos.origen = origenRiesgo(b.origen);
+  if (b.justificacion_origen !== undefined) datos.justificacion_origen = textoOpcional(b.justificacion_origen);
+  if (requerido || b.tipo_hallazgo !== undefined) datos.tipo_hallazgo = tipoHallazgo(b.tipo_hallazgo);
+  if (b.proyecto !== undefined) datos.proyecto = textoOpcional(b.proyecto);
+  if (requerido || b.descripcion !== undefined) datos.descripcion = textoObligatorio(b.descripcion, 'descripcion');
+  if (requerido || b.probabilidad !== undefined) datos.probabilidad = nivelOpcional(b.probabilidad, 'probabilidad');
+  for (const campo of Object.keys(CAMPOS_IMPACTO)) {
+    if (requerido || b[campo] !== undefined) datos[campo] = nivelOpcional(b[campo], campo);
+  }
+  if (b.estado !== undefined) datos.estado = estado(b.estado);
+  else if (requerido) datos.estado = 'abierto';
+  if (b.estrategia_respuesta !== undefined) datos.estrategia_respuesta = textoOpcional(b.estrategia_respuesta);
+  return datos;
+}
 
 // ---------- API externa (clave) ----------
 const externo = express.Router();
@@ -102,37 +161,67 @@ externo.use(exigirClave);
 
 externo.post('/riesgos', manejar(async (req, res) => {
   const b = req.body || {};
-  const datos = {
-    categoria: textoObligatorio(b.categoria, 'categoria'),
-    descripcion: textoObligatorio(b.descripcion, 'descripcion'),
-    probabilidad: nivel(b.probabilidad, 'probabilidad'),
-    impacto: nivel(b.impacto, 'impacto'),
-    estado: b.estado ? estado(b.estado) : 'abierto',
-    estrategia_respuesta: textoOpcional(b.estrategia_respuesta),
-  };
-  const o = origen(b);
+  const datos = leerDatosRiesgo(b, { requerido: true });
+  const o = origenDocumento(b);
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const { rows: [riesgo] } = await client.query(
-      `INSERT INTO riesgos (categoria, descripcion, probabilidad, impacto, estado, estrategia_respuesta)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [datos.categoria, datos.descripcion, datos.probabilidad, datos.impacto, datos.estado, datos.estrategia_respuesta]
+      `INSERT INTO riesgos (categoria, origen, justificacion_origen, tipo_hallazgo, proyecto, descripcion, probabilidad, impacto_cronograma, impacto_costo, impacto_calidad, impacto_alcance, estado, estrategia_respuesta)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [datos.categoria, datos.origen, datos.justificacion_origen || null, datos.tipo_hallazgo, datos.proyecto || null, datos.descripcion, datos.probabilidad, datos.impacto_cronograma, datos.impacto_costo, datos.impacto_calidad, datos.impacto_alcance, datos.estado, datos.estrategia_respuesta]
     );
     const { rows: [entrada] } = await client.query(
-      `INSERT INTO riesgos_historial (riesgo_id, fecha_documento, documento, fragmento, tipo_evento, cambios)
-       VALUES ($1,$2,$3,$4,'creacion',$5) RETURNING *`,
-      [riesgo.id, o.fecha_documento, o.documento, o.fragmento, JSON.stringify(datos)]
+      `INSERT INTO riesgos_historial (riesgo_id, fecha_documento, documento, fragmento, tipo_evento, cambios, nota)
+       VALUES ($1,$2,$3,$4,'creacion',$5,$6) RETURNING *`,
+      [riesgo.id, o.fecha_documento, o.documento, o.fragmento, JSON.stringify(datos), o.nota]
     );
     await client.query('COMMIT');
-    res.status(201).json({ riesgo: { ...riesgo, alta_exposicion: riesgo.exposicion >= UMBRAL }, historial: [entrada] });
+    res.status(201).json({ riesgo: conPendiente(riesgo), historial: [entrada] });
   } catch (e) {
     await client.query('ROLLBACK');
     throw e;
   } finally {
     client.release();
   }
+}));
+
+// Lista de riesgos activos (o todos), pensada para que un sistema externo (ej. n8n)
+// se la muestre completa a un modelo de IA y le pida comparar por significado si
+// el riesgo nuevo ya existe. No filtra por similitud de texto a proposito.
+externo.get('/riesgos', manejar(async (req, res) => {
+  const filtroEstado = textoOpcional(req.query.estado) || 'activos';
+  const proyecto = textoOpcional(req.query.proyecto);
+  const params = [];
+  const where = [];
+  if (filtroEstado === 'activos') where.push(`estado <> 'cerrado'`);
+  else if (filtroEstado !== 'todos') { params.push(estado(filtroEstado)); where.push(`estado = $${params.length}`); }
+  if (proyecto) { params.push(proyecto); where.push(`proyecto = $${params.length}`); }
+
+  const { rows } = await pool.query(
+    `SELECT * FROM riesgos ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY creado_en ASC`,
+    params
+  );
+  res.json({ total: rows.length, riesgos: rows.map(conPendiente) });
+}));
+
+// Riesgos (nuevos o actualizados) que quedaron con al menos una mencion proveniente de
+// este documento exacto. Pensado para que, despues de procesar un documento, un flujo
+// externo pueda armar un reporte de "que paso con esto que te mande" sin tener que
+// llevar el estado por su cuenta durante el procesamiento.
+externo.get('/riesgos/por-documento', manejar(async (req, res) => {
+  const documento = textoObligatorio(req.query.documento, 'documento');
+  const { rows } = await pool.query(
+    `SELECT r.*,
+            (SELECT json_agg(json_build_object('fecha_documento', h.fecha_documento, 'fragmento', h.fragmento, 'tipo_evento', h.tipo_evento, 'cambios', h.cambios, 'nota', h.nota) ORDER BY h.registrado_en)
+               FROM riesgos_historial h WHERE h.riesgo_id = r.id AND h.documento = $1) AS entradas
+       FROM riesgos r
+      WHERE EXISTS (SELECT 1 FROM riesgos_historial h WHERE h.riesgo_id = r.id AND h.documento = $1)
+      ORDER BY r.id ASC`,
+    [documento]
+  );
+  res.json({ documento, total: rows.length, riesgos: rows.map(conPendiente) });
 }));
 
 externo.get('/riesgos/similares', manejar(async (req, res) => {
@@ -143,8 +232,7 @@ externo.get('/riesgos/similares', manejar(async (req, res) => {
   const categoria = textoOpcional(req.query.categoria);
 
   const { rows } = await pool.query(
-    `SELECT id, categoria, descripcion, probabilidad, impacto, exposicion, estado, estrategia_respuesta,
-            round(similarity(descripcion, $1)::numeric, 3)::float AS similitud
+    `SELECT *, round(similarity(descripcion, $1)::numeric, 3)::float AS similitud
        FROM riesgos
       WHERE similarity(descripcion, $1) >= $2
         AND ($3 OR estado <> 'cerrado')
@@ -153,25 +241,20 @@ externo.get('/riesgos/similares', manejar(async (req, res) => {
       LIMIT 10`,
     [descripcion, umbral, incluirCerrados, categoria]
   );
-  res.json({ existe_parecido: rows.length > 0, umbral_similitud: umbral, coincidencias: rows });
+  res.json({ existe_parecido: rows.length > 0, umbral_similitud: umbral, coincidencias: rows.map(conPendiente) });
 }));
 
 externo.post('/riesgos/:id/historial', manejar(async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) throw new ErrorValidacion('id invalido');
   const b = req.body || {};
-  const o = origen(b);
+  const o = origenDocumento(b);
   const tipo = b.tipo_evento ? String(b.tipo_evento).trim().toLowerCase() : 'actualizacion';
   if (!TIPOS_EVENTO.includes(tipo) || tipo === 'creacion') {
     throw new ErrorValidacion('tipo_evento debe ser: mencion, confirmacion o actualizacion');
   }
 
-  const nuevos = {};
-  if (b.probabilidad !== undefined) nuevos.probabilidad = nivel(b.probabilidad, 'probabilidad');
-  if (b.impacto !== undefined) nuevos.impacto = nivel(b.impacto, 'impacto');
-  if (b.estado !== undefined) nuevos.estado = estado(b.estado);
-  if (b.estrategia_respuesta !== undefined) nuevos.estrategia_respuesta = textoOpcional(b.estrategia_respuesta);
-  if (b.categoria !== undefined) nuevos.categoria = textoObligatorio(b.categoria, 'categoria');
+  const nuevos = leerDatosRiesgo(b, { requerido: false });
 
   const client = await pool.connect();
   try {
@@ -198,12 +281,12 @@ externo.post('/riesgos/:id/historial', manejar(async (req, res) => {
     }
 
     const { rows: [entrada] } = await client.query(
-      `INSERT INTO riesgos_historial (riesgo_id, fecha_documento, documento, fragmento, tipo_evento, cambios)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [id, o.fecha_documento, o.documento, o.fragmento, tipo, Object.keys(cambios).length ? JSON.stringify(cambios) : null]
+      `INSERT INTO riesgos_historial (riesgo_id, fecha_documento, documento, fragmento, tipo_evento, cambios, nota)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [id, o.fecha_documento, o.documento, o.fragmento, tipo, Object.keys(cambios).length ? JSON.stringify(cambios) : null, o.nota]
     );
     await client.query('COMMIT');
-    res.status(201).json({ riesgo: { ...riesgo, alta_exposicion: riesgo.exposicion >= UMBRAL }, entrada_historial: entrada });
+    res.status(201).json({ riesgo: conPendiente(riesgo), entrada_historial: entrada });
   } catch (e) {
     await client.query('ROLLBACK');
     throw e;
@@ -217,17 +300,29 @@ externo.get('/riesgos/alta-exposicion-sin-estrategia', manejar(async (req, res) 
   if (!Number.isInteger(dias) || dias < 0) throw new ErrorValidacion('dias debe ser un entero mayor o igual a 0');
 
   const { rows } = await pool.query(
-    `SELECT id, categoria, descripcion, probabilidad, impacto, exposicion, estado, creado_en,
+    `SELECT *, GREATEST(exposicion_cronograma, exposicion_costo, exposicion_calidad, exposicion_alcance) AS exposicion_maxima,
             floor(extract(epoch FROM now() - creado_en) / 86400)::int AS dias_sin_estrategia
        FROM riesgos
-      WHERE exposicion >= $1
+      WHERE GREATEST(exposicion_cronograma, exposicion_costo, exposicion_calidad, exposicion_alcance) >= $1
         AND estado <> 'cerrado'
         AND estrategia_respuesta IS NULL
         AND creado_en <= now() - make_interval(days => $2)
-      ORDER BY exposicion DESC, creado_en ASC`,
+      ORDER BY exposicion_maxima DESC, creado_en ASC`,
     [UMBRAL, dias]
   );
   res.json({ umbral_alta_exposicion: UMBRAL, dias_minimos: dias, total: rows.length, riesgos: rows });
+}));
+
+// Genera el PDF de evaluacion de riesgos de un documento (titulo, documento/asunto/fecha,
+// linea separadora, y el detalle de cada riesgo, marcando si actualiza uno existente).
+// No toca la base de datos: solo renderiza lo que el flujo externo ya resolvio.
+externo.post('/reportes/analisis-documento', manejar(async (req, res) => {
+  const b = req.body || {};
+  const nombreArchivo = textoObligatorio(b.nombreArchivo, 'nombreArchivo');
+  const fechaDocumento = normalizarFecha(b.fechaDocumento);
+  const asuntoCorreo = textoOpcional(b.asuntoCorreo);
+  const riesgos = Array.isArray(b.riesgos) ? b.riesgos : [];
+  generarReporteAnalisis(res, { nombreArchivo, fechaDocumento, asuntoCorreo, riesgos });
 }));
 
 // ---------- Salud (sin login, para Railway) ----------
@@ -241,30 +336,63 @@ app.use('/api/externo', externo);
 // ---------- Panel y API interna (login) ----------
 app.use(exigirLogin);
 
-app.get('/api/interno/config', (req, res) => res.json({ umbral_alta_exposicion: UMBRAL, estados: ESTADOS }));
+app.get('/api/interno/config', manejar(async (req, res) => {
+  const { rows: [config] } = await pool.query('SELECT orden_prioridad FROM configuracion_registro WHERE id = 1');
+  res.json({
+    umbral_alta_exposicion: UMBRAL,
+    estados: ESTADOS,
+    dimensiones: DIMENSIONES,
+    origenes: ORIGENES,
+    orden_prioridad: config.orden_prioridad,
+  });
+}));
+
+app.post('/api/interno/config/orden-prioridad', manejar(async (req, res) => {
+  const orden = (req.body || {}).orden;
+  const valido = Array.isArray(orden) && orden.length === DIMENSIONES.length
+    && new Set(orden).size === DIMENSIONES.length
+    && orden.every((d) => DIMENSIONES.includes(d));
+  if (!valido) throw new ErrorValidacion(`orden debe ser un arreglo con exactamente estas 4 dimensiones, sin repetir: ${DIMENSIONES.join(', ')}`);
+  await pool.query('UPDATE configuracion_registro SET orden_prioridad = $1 WHERE id = 1', [orden]);
+  res.json({ orden_prioridad: orden });
+}));
 
 app.get('/api/interno/categorias', manejar(async (req, res) => {
   const { rows } = await pool.query('SELECT DISTINCT categoria FROM riesgos ORDER BY categoria');
   res.json(rows.map((r) => r.categoria));
 }));
 
+app.get('/api/interno/proyectos', manejar(async (req, res) => {
+  const { rows } = await pool.query('SELECT DISTINCT proyecto FROM riesgos WHERE proyecto IS NOT NULL ORDER BY proyecto');
+  res.json(rows.map((r) => r.proyecto));
+}));
+
 app.get('/api/interno/riesgos', manejar(async (req, res) => {
   const categoria = textoOpcional(req.query.categoria);
+  const origenFiltro = textoOpcional(req.query.origen);
+  const proyectoFiltro = textoOpcional(req.query.proyecto);
   const filtroEstado = textoOpcional(req.query.estado) || 'activos';
   const params = [];
   const where = [];
   if (filtroEstado === 'activos') where.push(`estado <> 'cerrado'`);
   else if (filtroEstado !== 'todos') { params.push(estado(filtroEstado)); where.push(`estado = $${params.length}`); }
   if (categoria) { params.push(categoria); where.push(`categoria = $${params.length}`); }
+  if (origenFiltro && origenFiltro !== 'todos') { params.push(origenRiesgo(origenFiltro)); where.push(`origen = $${params.length}`); }
+  if (proyectoFiltro && proyectoFiltro !== 'todos') { params.push(proyectoFiltro); where.push(`proyecto = $${params.length}`); }
+
+  const { rows: [config] } = await pool.query('SELECT orden_prioridad FROM configuracion_registro WHERE id = 1');
+  const ordenValido = (config.orden_prioridad || []).filter((d) => DIMENSIONES.includes(d));
+  const ordenCompleto = [...ordenValido, ...DIMENSIONES.filter((d) => !ordenValido.includes(d))];
+  const ordenSql = ordenCompleto.map((d) => `exposicion_${d} DESC NULLS LAST`).join(', ');
 
   const { rows } = await pool.query(
     `SELECT r.*, (SELECT count(*)::int FROM riesgos_historial h WHERE h.riesgo_id = r.id) AS menciones
        FROM riesgos r
       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-      ORDER BY exposicion DESC, creado_en ASC`,
+      ORDER BY ${ordenSql}, creado_en ASC`,
     params
   );
-  res.json(rows);
+  res.json({ orden_prioridad: ordenCompleto, riesgos: rows.map(conPendiente) });
 }));
 
 app.get('/api/interno/riesgos/:id/historial', manejar(async (req, res) => {
