@@ -77,6 +77,7 @@ select {
   border-radius: 8px; padding: 14px 16px; border-left: 4px solid transparent;
 }
 .tarjeta.alta { border-left-color: var(--critico); background: var(--fila-alta); }
+.tarjeta.alta .exp-num { color: var(--critico); }
 .tarjeta-exp { flex: 0 0 70px; text-align: center; }
 .tarjeta-exp .exp-num { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .tarjeta-exp .exp-label { font-size: 11px; color: var(--ink-2); text-transform: uppercase; }
